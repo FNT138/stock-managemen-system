@@ -1,266 +1,435 @@
 import os
-import datetime
-import json
+import time
+import requests
 import pdfplumber
 import re
-from database import update_product, log_sale_db, get_next_sale_number
+import datetime
+import json
+from bs4 import BeautifulSoup
+from database import update_product, log_sale_db, get_next_sale_number, add_product
 
+import config
+
+# --- CONFIGURATION ---
 LOG_DIR = "logs"
+DOWNLOADS_DIR = config.STATIC_DIR
+MISSING_IMAGES_LOG = "missing_images.txt"
+
+# Search Template - Editable
+# Example: https://norbertominero.com.ar/buscar?controller=search&s=1010
+SEARCH_TEMPLATE = "https://norbertominero.com.ar/buscar?controller=search&s={CODE}"
+
+# Request Headers to mimic a browser
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+# Ensure directories exist
+for d in [LOG_DIR, DOWNLOADS_DIR]:
+    if not os.path.exists(d):
+        os.makedirs(d)
 
 def calculate_sale_price(cost_price):
-    """Business rule: Cost + 51%"""
-    if cost_price is None:
-        return 0.0
+    if cost_price is None: return 0.0
     return round(cost_price * 1.51, 2)
 
-def parse_pdf_catalog(pdf_file):
+# ==============================================================================
+# PHASE 1: The Data Skeleton (PDF Parsing)
+# ==============================================================================
+
+def extract_brand_from_cell(page, cell_rect):
     """
-    Parses a PDF using geometric analysis (extract_words) to handle grid layouts.
-    Structure:
-    - [Image space]
-    - Name / Category / Brand (Text block)
-    - "Código: ..."
-    - "Precio sin IVA:..... 123.45"
-    """
-    products = []
+    Scans a specific rectangular area (the Description cell) for text 
+    that is BOTH Bold and UPPERCASE.
     
+    cell_rect: (x0, top, x1, bottom)
+    """
+    # Crop the page to the cell
     try:
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
-                
-                # 1. Identify Anchors: Price
-                # We look for the sequence "Precio" "sin" "IVA" or just "Precio" close to a number.
-                # However, words are individual tokens.
-                # Let's group words into 'lines' first to simplify text searching while keeping geometry.
-                
-                # Sort by Y then X
-                words.sort(key=lambda w: (round(w['top']), w['x0']))
-                
-                # Group into lines
-                lines = []
-                current_line = []
-                if words:
-                    current_y = words[0]['top']
-                    for w in words:
-                        if abs(w['top'] - current_y) > 5: # New line threshold
-                            lines.append(current_line)
-                            current_line = []
-                            current_y = w['top']
-                        current_line.append(w)
-                    lines.append(current_line)
-                
-                # 2. Find Price Blocks and Code Blocks in lines
-                price_blocks = [] # List of {'price': float, 'rect': (x0, top, x1, bottom)}
-                code_blocks = [] # List of {'code': str, 'rect': ...}
-                other_text_blocks = [] # Potential name text
-                
-                for line in lines:
-                    # Reconstruct line text to check pattern
-                    line_text = " ".join([w['text'] for w in line])
-                    
-                    # Check for Price
-                    # Pattern: "Precio" ... digits
-                    if "Precio" in line_text and "IVA" in line_text:
-                        # Extract value. We can look at the words in the line.
-                        # Usually the price is the last few tokens.
-                        # Look for digits in the reverse order of words
-                        price_val = 0.0
-                        # Heuristic: Join all words that look like parts of a number at the end
-                        # "7", ".420,00" -> "7.420,00"
-                        # Or "180,00"
-                        
-                        # Find index of "IVA" or "IVA:" or "IVA:....."
-                        try:
-                            # Robust search for where the price 'headers' end
-                            # We can just search for ANY sequence of chars that forms a valid price number at the end
-                            # Iterate words backwards
-                            num_str = ""
-                            used_words = []
-                            for w in reversed(line):
-                                txt = w['text'].replace('.', '').replace(',', '.')
-                                # Check if it looks like a part of number or currency
-                                if re.match(r'^[\d\.]+$', txt):
-                                    num_str = w['text'] + num_str # Prepend since we are going backwards
-                                    used_words.append(w)
-                                elif "IVA" in w['text'] or "..." in w['text']:
-                                    break
-                            
-                            # Clean num_str
-                            # "7.420,00" -> "7420.00"
-                            clean_price = num_str.replace(' ', '').replace('.', '').replace(',', '.')
-                            price_val = float(clean_price)
-                            
-                            # Define rect for this block (uses the whole line or just the center?)
-                            # Use the geometric center of the 'Precio...Price' line as the anchor X
-                            x_center = (line[0]['x0'] + line[-1]['x1']) / 2
-                            rect = {
-                                'x0': line[0]['x0'],
-                                'top': line[0]['top'],
-                                'bottom': line[0]['bottom'],
-                                'x_center': x_center
-                            }
-                            price_blocks.append({'price': price_val, 'rect': rect})
-                        except:
-                            pass # Failed to parse price
-                            
-                    # Check for Code
-                    elif "Código" in line_text or "Codigo" in line_text:
-                        # Logic: Extract code text after "Código:"
-                        # Sometimes "Código:" is its own word, sometimes "Código:W"
-                        # We want the text after the label.
-                        joined_text = "".join([w['text'] for w in line]) # Remove spaces to handle "Código: W" vs "Código :W"
-                        # Regex on joined text might be safer
-                        # joined: Código:W207001
-                        # Regex: Código:?(.+)
-                        match = re.search(r'Códiho:?(.+)', joined_text) or re.search(r'Código:?(.+)', joined_text)
-                        if match:
-                            code_str = match.group(1).strip()
-                            x_center = (line[0]['x0'] + line[-1]['x1']) / 2
-                            rect = {
-                                'x0': line[0]['x0'],
-                                'top': line[0]['top'],
-                                'bottom': line[0]['bottom'],
-                                'x_center': x_center
-                            }
-                            code_blocks.append({'code': code_str, 'rect': rect})
-                            
-                    else:
-                        # Probably Name/Brand text
-                        # Store it for matching
-                        x_center = (line[0]['x0'] + line[-1]['x1']) / 2
-                        rect = {
-                            'x0': line[0]['x0'],
-                            'top': line[0]['top'],
-                            'bottom': line[0]['bottom'],
-                            'x_center': x_center
-                        }
-                        other_text_blocks.append({'words': line, 'rect': rect})
-
-                # 3. Match Blocks: Price -> Code -> Name
-                # Strategy: For each Price, find the closest Code above it with similar X-center.
-                # Threshold for X alignment: +/- 50 to 100 pixels (columns are usually distinct)
-                
-                for p_block in price_blocks:
-                    p_rect = p_block['rect']
-                    
-                    # Find Code
-                    # Candidates: strictly above price (bottom < price.top)
-                    # Horizontally aligned (abs(code.x - price.x) < threshold)
-                    candidates = [
-                        c for c in code_blocks 
-                        if c['rect']['bottom'] <= p_rect['top'] + 5 # slight overlap allowed
-                        and abs(c['rect']['x_center'] - p_rect['x_center']) < 100
-                    ]
-                    # Pick the closest one vertically (max top)
-                    if not candidates:
-                        continue
-                        
-                    best_code = max(candidates, key=lambda c: c['rect']['top'])
-                    
-                    # Find Name
-                    # Candidates: strictly above Code
-                    # Horizontally aligned
-                    # Stop if we hit another Code or Price (which would belong to row above)
-                    
-                    # Search range: From Code Top upwards to... say, 150 pixels? Or until another product.
-                    # Actually, we can just grab all 'other_text' blocks that fit the geometry match
-                    # and are "immediately" above.
-                    
-                    name_candidates = [
-                        t for t in other_text_blocks
-                        if t['rect']['bottom'] <= best_code['rect']['top'] + 5
-                        and abs(t['rect']['x_center'] - p_rect['x_center']) < 100
-                    ]
-                    
-                    # Sort candidates by top (highest first? or lowest first i.e. closest to code?)
-                    # Text usually reads top-down.
-                    # We need to filter out text that belongs to the product ABOVE this one.
-                    # Heuristic: The gap between "This Product's Name" and "Product Above Price" is usually larger?
-                    # Or simply: take the closest N lines?
-                    # Let's take *all* candidates that are within a reasonable vertical distance (e.g. 100px) from Code.
-                    
-                    relevant_lines = []
-                    for t in name_candidates:
-                        if (best_code['rect']['top'] - t['rect']['bottom']) < 100:
-                            relevant_lines.append(t)
-                            
-                    # Sort by Y (top to bottom)
-                    relevant_lines.sort(key=lambda x: x['rect']['top'])
-                    
-                    full_name_words = []
-                    for line_block in relevant_lines:
-                        # Filter out potential garbage or headers if needed
-                        full_name_words.extend([w['text'] for w in line_block['words']])
-                        
-                    # Now parsing Name/Brand from the collected words
-                    # "Asiento MTB c/guia ... negro/rojo"
-                    # User rules: 
-                    # - Category (multiple words)
-                    # - Brand (ALL CAPS)
-                    # - Description (starts with Number or rest)
-                    
-                    brand = "Generic"
-                    category = []
-                    description = []
-                    
-                    state = "CATEGORY"
-                    for word in full_name_words:
-                        clean_word = word.strip(".,/")
-                        if not clean_word: continue
-                        
-                        if state == "CATEGORY":
-                            if word.isupper() and len(clean_word) > 1 and not word[0].isdigit():
-                                brand = word
-                                state = "DESCRIPTION"
-                            elif word[0].isdigit():
-                                state = "DESCRIPTION"
-                                description.append(word)
-                            else:
-                                category.append(word)
-                        else:
-                            description.append(word)
-                            
-                    final_name = " ".join(category) + " " + " ".join(description)
-                    if not final_name.strip():
-                        final_name = "Unknown Product"
-
-                    products.append({
-                        "code": best_code['code'],
-                        "name": final_name,
-                        "brand": brand,
-                        "cost_price": p_block['price']
-                    })
-                    
-    except Exception as e:
-        print(f"Error parsing PDF: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+        # pdfplumber rect is (x0, top, x1, bottom)
+        cell_crop = page.crop(cell_rect)
         
-    return products
+        # Extract words with font info
+        words = cell_crop.extract_words(extra_attrs=['fontname'])
+        
+        brand_parts = []
+        for w in words:
+            text = w['text']
+            font = w['fontname'].lower()
+            
+            # Check criteria
+            is_bold = 'bold' in font or 'black' in font
+            is_upper = text.isupper()
+            # Ignore numbers or small tokens if needed, but User said "Bold AND UPPER".
+            # Sometimes brands have numbers like "3M". 
+            
+            if is_bold and is_upper:
+                brand_parts.append(text)
+        
+        if brand_parts:
+            return " ".join(brand_parts)
+            
+    except Exception:
+        pass # Cropping might fail if rect is invalid
+        
+    return "Generic" # Default
 
+def process_data_pdf(pdf_path):
+    """
+    Parses the Text-PDF with strict 4-column layout:
+    Col 0: Code
+    Col 1: Content (Name TYPE BRAND Description)
+    Col 2: Xbulto (Ignore)
+    Col 3: Price
+    """
+    extracted_products = []
+    
+    print(f"[Phase 1] Parsing PDF: {pdf_path}")
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        total_pages = len(pdf.pages)
+        
+        for i, page in enumerate(pdf.pages):
+            if i % 1 == 0: print(f"[Phase 1] Processing Page {i+1}/{total_pages}...")
+            
+            # Find tables
+            tables = page.find_tables()
+            
+            for table in tables:
+                table_data = table.extract()
+                table_rows = table.rows
+                
+                for row_idx, row_data in enumerate(table_data):
+                    clean_row = [c for c in row_data if c and c.strip()]
+                    
+                    # Less than 3 valid items? Likely invalid
+                    if len(clean_row) < 3: continue
+                    
+                    # MAPPING based on User feedback:
+                    # Raw Row often has empty cells.
+                    # e.g. ["W123", "Product Name...", "50", "12.00"]
+                    # If some are empty, indices shift in `clean_row`.
+                    # But `row_data` preserves Structure (None for empty).
+                    
+                    # We expect roughly 4 columns in the visual table.
+                    # Let's rely on `row_data` indices if possible, or mapping clean_row.
+                    
+                    # 1. CODE (Always Col 0)
+                    code = row_data[0]
+                    if not code: code = clean_row[0] # Fallback
+                    if not code or code.lower() in ['código', 'codigo', 'code']: continue
+                    
+                    # 2. PRICE (Heuristic Strategy)
+                    # User states: Col 4 (index 3) is Price. Col 3 (index 2) is Ignore (Xbulto).
+                    # We will try to fetch from Index 3 first. If not, scan backwards.
+                    
+                    cost_price = 0.0
+                    
+                    def parse_price_str(s):
+                        if not s: return None
+                        # Remove Currency symbol and whitespace
+                        s_clean = s.replace('$', '').strip()
+                        if not s_clean: return None
+                        
+                        # Handle formats:
+                        # 1.234,56 (AR/EU) -> remove dots, replace comma with dot
+                        # 1,234.56 (US) -> remove comma, keep dot (Less likely but possible)
+                        # Simple Heuristic: 
+                        # If matches ^[\d]+$ (Int) -> OK
+                        # If matches ^[\d\.]+,[\d]+$ (AR) -> 1234.56
+                        
+                        # Aggressive cleaning for standard AR usage:
+                        # Remove ALL spaces
+                        s_clean = s_clean.replace(' ', '')
+                        
+                        # Replace . with nothing (thousands)
+                        # Replace , with . (decimal)
+                        # BUT be careful if it is 123.45 (US style simple float) and no thousands.
+                        # Conflict: 1.200 (1200) vs 1.2 (1.20).
+                        # Context: Prices usually > 1?
+                        
+                        # Let's try standard replace first
+                        try_ar = s_clean.replace('.', '').replace(',', '.')
+                        try:
+                            return float(try_ar)
+                        except:
+                            pass
+                            
+                        # Try direct float (US style)
+                        try:
+                            return float(s_clean)
+                        except:
+                            return None
+
+                    # A. Try strict Column 3 (4th column)
+                    if len(row_data) > 3:
+                        p_val = parse_price_str(row_data[3])
+                        if p_val is not None:
+                            cost_price = p_val
+                            
+                    # B. If failed, try last item of clean_row
+                    if cost_price == 0.0 and len(clean_row) > 0:
+                        p_val = parse_price_str(clean_row[-1])
+                        if p_val is not None:
+                            cost_price = p_val
+                            
+                    if cost_price == 0.0:
+                        print(f"[WARN] Failed to parse price for CODE: {code}. Raw Row: {clean_row}")
+                    
+                    # 3. CONTENT (Col 1)
+                    raw_content = ""
+                    content_cell_rect = None
+                    
+                    if len(row_data) > 1 and row_data[1]:
+                        raw_content = row_data[1].replace('\n', ' ').strip()
+                        # Get rect for Brand extraction
+                        if row_idx < len(table_rows) and len(table_rows[row_idx].cells) > 1:
+                            content_cell_rect = table_rows[row_idx].cells[1]
+                    else:
+                         # Fallback if row_data[1] is None?? Unlikely for a valid row
+                         continue
+
+                    # 4. PARSING CONTENT
+                    # Format: "Name TYPE Brand Description"
+                    # - Brand: Extract via Bold Style
+                    brand = "Generic"
+                    if content_cell_rect:
+                        brand = extract_brand_from_cell(page, content_cell_rect)
+                    
+                    # Remove Brand from content string to simplify parsing
+                    # (Simple string replace, might correspond to exact substring)
+                    if brand != "Generic":
+                        # Case insensitive replace?
+                        pattern = re.compile(re.escape(brand), re.IGNORECASE)
+                        content_minus_brand = pattern.sub("", raw_content).strip()
+                    else:
+                        content_minus_brand = raw_content
+                        
+                    # Split Name vs Type vs Description
+                    # User: "Name is first... Type is UPPERCASE... Description has numbers"
+                    tokens = content_minus_brand.split()
+                    
+                    name_parts = []
+                    type_parts = []
+                    desc_parts = []
+                    
+                    # Heuristic State Machine being simple:
+                    # 1. Accumulate Name until we hit an ALL-CAPS word (Type)?
+                    #    But Name itself might be "ASIENTO" (all caps).
+                    #    User ex: "Asiento NENA 14/16..." -> Name=Asiento, Type=NENA
+                    #    User ex: "Asiento freestyle..." -> Type is Uppercase? "freestyle" is lower.
+                    #    User said: "type (MTB, freestyle, etc.) always in uppercase"
+                    #    So "FREESTYLE" would be type.
+                    
+                    # Let's try:
+                    # First word is always Name?
+                    # Then look for Type-like Uppercase words.
+                    # The rest is Description.
+                    
+                    if not tokens:
+                        final_name = "Unknown"
+                        category = "Generic"
+                        description = ""
+                    else:
+                        # Assumed Name = First Word + maybe more?
+                        # Let's treat valid Categories as Upper Case words found early.
+                        
+                        # Simplistic approach:
+                        # Name = First word
+                        # Rest = Scan for Upper Case -> Category
+                        # Everything else -> Description
+                        
+                        final_name = tokens[0] # "Asiento"
+                        category_found = []
+                        remaining_tokens = tokens[1:]
+                        
+                        desc_tokens = []
+                        
+                        for t in remaining_tokens:
+                            # Uppercase and length > 2 (avoid 'A', 'Y', 'X' noise?)
+                            # User said "always in uppercase". 
+                            # "NENA", "KALF" (Wait, KALF might be Brand?)
+                            # If we extracted Brand separately, KALF might be gone.
+                            # If Brand wasn't bold, it might still be here.
+                            
+                            if t.isupper() and len(t) > 1 and not any(c.isdigit() for c in t):
+                                category_found.append(t)
+                            else:
+                                desc_tokens.append(t)
+                                
+                        if category_found:
+                            category = " ".join(category_found)
+                        else:
+                            category = "Generic"
+                        
+                        if desc_tokens:
+                            description = " ".join(desc_tokens)
+                        else:
+                            description = ""
+                            
+                        # If the name is just one word, maybe append if description looks like text?
+                        # User wants separate columns.
+                    
+                    extracted_products.append({
+                        'code': code.strip(),
+                        'name': final_name,
+                        'brand': brand,
+                        'category': category,
+                        'description': description,
+                        'cost_price': cost_price,
+                        'image_path': None # Computed later
+                    })
+
+    print(f"[Phase 1] Completed. Found {len(extracted_products)} products.")
+    return extracted_products
+
+# ==============================================================================
+# PHASE 2: The Image Skin (Web Scraping)
+# ==============================================================================
+
+def scrape_product_images(product_list, progress_callback=None):
+    """
+    Iterates through products, searches web, downloads image.
+    Updates the 'image_path' key in the product dicts.
+    
+    progress_callback: function(current, total) for UI updates.
+    """
+    total = len(product_list)
+    print(f"[Phase 2] Starting Web Scraping including 1s delay (Total: {total})...")
+    
+    with open(MISSING_IMAGES_LOG, "w") as missing_log:
+        for i, product in enumerate(product_list):
+            code = product['code']
+            filename = f"{code.replace('/','-')}.jpg"
+            # Absolute path for saving file
+            local_abs_path = os.path.join(DOWNLOADS_DIR, filename)
+            # Relative path for Database (portable)
+            db_rel_path = f"{config.STATIC_DIR_NAME}/{filename}"
+
+            print(f"[DEBUG] Processing {i}/{total} - Code: {code}")
+
+            # 1. Check if we already have it locally
+            if os.path.exists(local_abs_path):
+                print(f"[DEBUG] Image already exists locally for CODE: {code}, skipping download")
+                product['image_path'] = db_rel_path
+                if progress_callback: progress_callback(i, total)
+                continue
+
+            # report progress
+            if progress_callback:
+                progress_callback(i, total)
+            elif i % 10 == 0:
+                print(f"[INFO] Scraping {i}/{total} - Code: {code}")
+            
+            # 2. Construct Search URL
+            url = SEARCH_TEMPLATE.format(CODE=code)
+            
+            try:
+                # 3. Request
+                print(f"[DEBUG] Web request for CODE: {code} -> {url}")
+                response = requests.get(url, headers=HEADERS, timeout=10)
+                time.sleep(1) # Respectful delay
+                
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # 4. Extract Image URL
+                    # ADAPT SELECTOR HERE based on site inspection.
+                    img_tag = soup.select_one("article.product-miniature div.thumbnail-container img")
+                    
+                    # Fallback selectors if site is different
+                    if not img_tag:
+                        img_tag = soup.select_one(".product_img_link img") # Older PS
+                    if not img_tag:
+                         img_tag = soup.select_one(".product-image img")
+                         
+                    if img_tag:
+                        img_url = img_tag.get('src') or img_tag.get('data-src')
+                        
+                        # Download Image
+                        if img_url:
+                            print(f"[DEBUG] Downloading image for CODE: {code} from {img_url}")
+                            img_data = requests.get(img_url, headers=HEADERS, timeout=10).content
+                            
+                            with open(local_abs_path, "wb") as f:
+                                f.write(img_data)
+                                
+                            product['image_path'] = db_rel_path
+                            print(f"[INFO] Downloaded image for CODE: {code}")
+                        else:
+                             print(f"[WARN] Img tag found but no src for CODE: {code}")
+                             missing_log.write(f"{code}: Img tag found but no src\n")
+                    else:
+                        print(f"[WARN] No image selector matched for CODE: {code}")
+                        missing_log.write(f"{code}: No image selector matched\n")
+                else:
+                    print(f"[ERROR] HTTP {response.status_code} for CODE: {code}")
+                    missing_log.write(f"{code}: HTTP {response.status_code}\n")
+                    
+            except Exception as e:
+                print(f"[ERROR] Exception processing {code}: {e}")
+                missing_log.write(f"{code}: Exception {e}\n")
+                
+            # Default missing path
+            if 'image_path' not in product:
+                product['image_path'] = None
+
+    if progress_callback: progress_callback(total, total)
+    print("[Phase 2] Completed.")
+    return product_list
+
+# ==============================================================================
+# PHASE 3: DB Assembly
+# ==============================================================================
+
+def run_etl_pipeline(pdf_path, progress_callback=None):
+    """
+    Master function to run Phase 1 (PDF) + Phase 2 (Scrape) + Phase 3 (DB).
+    """
+    # Phase 1
+    products = process_data_pdf(pdf_path)
+    
+    # Phase 2
+    products = scrape_product_images(products, progress_callback)
+    
+    # Phase 3
+    added_count = 0
+    print(f"[Phase 3] Updating Database with {len(products)} items...")
+    for i, p in enumerate(products):
+        print(f"[DEBUG] DB Sync {i}/{len(products)} - Code: {p['code']}")
+        
+        if add_product(
+            code=p['code'],
+            name=p['name'],
+            category=p['category'],
+            brand=p['brand'],
+            cost_price=p['cost_price'],
+            image_path=p['image_path'],
+            description=p.get('description', '')
+        ):
+            added_count += 1
+            print(f"[INFO] DB Insert/Update Success: {p['code']}")
+        else:
+             print(f"[WARN] DB Insert/Update Failed/Skipped: {p['code']}")
+            
+    print(f"[Phase 3] Done. Added/Updated {added_count} records.")
+    return added_count
+
+# ==============================================================================
+# SALES LOGIC (Unchanged)
+# ==============================================================================
 def process_sale_transaction(cart_items):
-    """
-    Finalize a sale.
-    cart_items: List of dicts {'code': str, 'name': str, 'brand': str, 'quantity': int, 'sale_price': float}
-    """
     total_value = sum(item['quantity'] * item['sale_price'] for item in cart_items)
     sale_timestamp = datetime.datetime.now()
     sale_number = get_next_sale_number()
     
-    # 1. Update Stock in DB
     for item in cart_items:
-        # Subtract quantity
         update_product(item['code'], stock_delta=-item['quantity'])
     
-    # 2. Generate Log File
-    # Filename: venta_[SaleNumber]_[Timestamp].log
     ts_str = sale_timestamp.strftime("%Y%m%d-%H%M%S")
     filename = f"venta_{sale_number}_{ts_str}.log"
     filepath = os.path.join(LOG_DIR, filename)
     
-    # Content format: Product Name, Brand, Code, Quantity sold, Price sold
     log_content = []
     for item in cart_items:
         line = f"{item['name']}, {item.get('brand','N/A')}, {item['code']}, {item['quantity']}, {item['sale_price']}"
@@ -269,10 +438,9 @@ def process_sale_transaction(cart_items):
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(log_content))
-    except OSError as e:
-        print(f"Error writing log file: {e}")
+    except Exception as e:
+        print(f"Error logging: {e}")
 
-    # 3. Log to internal DB for record keeping
     items_json = json.dumps(cart_items)
     log_sale_db(total_value, items_json)
     

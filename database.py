@@ -1,22 +1,26 @@
 import sqlite3
 import os
 from datetime import datetime
+import config
 
-DB_NAME = "products.db"
+DB_NAME = config.DB_PATH
 
 def init_db():
     """Initialize the database with necessary tables."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
+
     # Products table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
+            category TEXT,
             brand TEXT,
-            image_data BLOB,
+            description TEXT,
+            image_path TEXT,
             cost_price REAL DEFAULT 0.0,
             stock_quantity INTEGER DEFAULT 0
         )
@@ -38,19 +42,42 @@ def init_db():
 def get_connection():
     return sqlite3.connect(DB_NAME)
 
-def add_product(code, name, brand, cost_price, image_data=None, stock_quantity=0):
-    """Add a single product to the database."""
+def add_product(code, name, category, brand, cost_price, image_path=None, stock_quantity=0, description=None):
+    """Add a single product or update if exists (upsert). Preserves existing stock_quantity."""
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute('''
-            INSERT INTO products (code, name, brand, cost_price, image_data, stock_quantity)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (code, name, brand, cost_price, image_data, stock_quantity))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        print(f"Product with code {code} already exists.")
+        # Use INSERT OR REPLACE with special handling to preserve stock_quantity
+        # First check if product exists to preserve its stock
+        cursor.execute('SELECT stock_quantity, image_path FROM products WHERE code = ?', (code,))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Product exists - update price and details, preserve stock and image if new image is None
+            existing_stock = existing[0]
+            existing_image = existing[1]
+            final_image = image_path if image_path else existing_image
+            
+            cursor.execute('''
+                UPDATE products SET 
+                    name = ?, category = ?, brand = ?, description = ?, 
+                    cost_price = ?, image_path = ?
+                WHERE code = ?
+            ''', (name, category, brand, description, cost_price, final_image, code))
+            conn.commit()
+            print(f"Product {code} updated with new price: {cost_price}")
+            return True
+        else:
+            # New product - insert with provided stock_quantity (default 0)
+            cursor.execute('''
+                INSERT INTO products (code, name, category, brand, description, cost_price, image_path, stock_quantity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (code, name, category, brand, description, cost_price, image_path, stock_quantity))
+            conn.commit()
+            print(f"Product {code} added as new product.")
+            return True
+    except Exception as e:
+        print(f"Error adding/updating product {code}: {e}")
         return False
     finally:
         conn.close()
