@@ -147,13 +147,135 @@ with tab1:
 
     st.divider()
     
-    # Database Table
+    # Product Grid View
     st.subheader("Product Database")
     all_products = db.get_all_products()
     if all_products:
         df = pd.DataFrame(all_products)
-        # Display simplified table
-        st.dataframe(df[['code', 'name', 'brand', 'description', 'cost_price', 'stock_quantity']], width="stretch")
+        
+        # Search filter
+        search_filter = st.text_input("🔍 Filter products", placeholder="Search by name, brand, code or description...", key="stock_search")
+        
+        if search_filter:
+            filtered_products = [
+                p for p in all_products 
+                if search_filter.lower() in p['name'].lower() 
+                or search_filter.lower() in str(p.get('brand', '')).lower() 
+                or search_filter.lower() in str(p['code']).lower()
+                or search_filter.lower() in str(p.get('description', '')).lower()
+            ]
+        else:
+            filtered_products = all_products
+        
+        # Pagination settings
+        products_per_page = 20
+        total_pages = max(1, (len(filtered_products) + products_per_page - 1) // products_per_page)
+        
+        if 'stock_page' not in st.session_state:
+            st.session_state.stock_page = 1
+        
+        # Page navigation
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+        with nav_col1:
+            if st.button("⬅️ Anterior", disabled=st.session_state.stock_page <= 1):
+                st.session_state.stock_page -= 1
+                st.rerun()
+        with nav_col2:
+            st.caption(f"Página {st.session_state.stock_page} de {total_pages} | {len(filtered_products)} productos")
+        with nav_col3:
+            if st.button("Siguiente ➡️", disabled=st.session_state.stock_page >= total_pages):
+                st.session_state.stock_page += 1
+                st.rerun()
+        
+        # Get current page products
+        start_idx = (st.session_state.stock_page - 1) * products_per_page
+        end_idx = start_idx + products_per_page
+        page_products = filtered_products[start_idx:end_idx]
+        
+        # 4-column grid
+        chunk_size = 4
+        chunks = [page_products[i:i + chunk_size] for i in range(0, len(page_products), chunk_size)]
+        
+        for chunk in chunks:
+            cols = st.columns(chunk_size)
+            for i, prod in enumerate(chunk):
+                with cols[i]:
+                    with st.container(border=True):
+                        # Image
+                        image_shown = False
+                        db_rel_path = prod.get('image_path')
+                        
+                        if db_rel_path:
+                            db_rel_path = db_rel_path.replace('\\', '/')
+                            abs_path = os.path.join(config.BASE_DIR, db_rel_path)
+                            if os.path.exists(abs_path):
+                                st.image(abs_path, width="stretch")
+                                image_shown = True
+                        
+                        if not image_shown:
+                            safe_code = prod['code'].replace('/', '-')
+                            fallback_abs_path = os.path.join(config.STATIC_DIR, f"{safe_code}.jpg")
+                            if os.path.exists(fallback_abs_path):
+                                st.image(fallback_abs_path, width="stretch")
+                                image_shown = True
+                        
+                        if not image_shown:
+                            st.image("https://placehold.co/150x150?text=No+Image", width="stretch")
+                        
+                        # Product Info
+                        st.markdown(f"**{prod['name'][:30]}**")
+                        st.caption(f"📦 `{prod['code']}`")
+                        st.caption(f"Marca: {prod.get('brand', 'N/A')}")
+                        
+                        sale_price = logic.calculate_sale_price(prod['cost_price'])
+                        st.markdown(f"💰 **Costo:** ${prod['cost_price']:,.0f}")
+                        st.markdown(f"🏷️ **Venta:** ${sale_price:,.0f}")
+                        st.markdown(f"📊 **Stock:** {prod['stock_quantity']}")
+                        
+                        desc = prod.get('description', '') or 'Sin descripción'
+                        st.caption(f"{desc[:50]}...")
+                        
+                        # Add to Order button
+                        with st.expander("📦 Agregar a Pedido"):
+                            order_qty = st.number_input(
+                                "Cantidad", 
+                                min_value=1, 
+                                value=1, 
+                                key=f"stock_order_qty_{prod['code']}"
+                            )
+                            if st.button("➕ Agregar", key=f"stock_add_order_{prod['code']}", type="primary"):
+                                existing = next((item for item in st.session_state.supply_order if item['code'] == prod['code']), None)
+                                if existing:
+                                    existing['quantity'] += order_qty
+                                    st.toast(f"Actualizado: {prod['name']} (+{order_qty})")
+                                else:
+                                    st.session_state.supply_order.append({
+                                        'code': prod['code'],
+                                        'name': prod['name'],
+                                        'quantity': order_qty,
+                                        'cost_price': prod['cost_price']
+                                    })
+                                    st.toast(f"Agregado: {prod['name']} x{order_qty}")
+                                st.rerun()
+        
+        # Bottom navigation
+        st.markdown("---")
+        bot_col1, bot_col2, bot_col3 = st.columns([1, 2, 1])
+        with bot_col1:
+            if st.button("⬅️ Anterior", key="prev_bottom", disabled=st.session_state.stock_page <= 1):
+                st.session_state.stock_page -= 1
+                st.rerun()
+        with bot_col2:
+            st.caption(f"Página {st.session_state.stock_page} de {total_pages}")
+        with bot_col3:
+            if st.button("Siguiente ➡️", key="next_bottom", disabled=st.session_state.stock_page >= total_pages):
+                st.session_state.stock_page += 1
+                st.rerun()
+        
+        # Back to top button (using HTML anchor)
+        st.markdown('<a href="#product-database" style="text-decoration:none;">⬆️ Volver arriba</a>', unsafe_allow_html=True)
+        
+        st.divider()
         
         # Edit Product Section
         st.subheader("Edit Product")
@@ -217,188 +339,114 @@ with tab1:
 # ==========================================
 with tab2:
     st.header("Restocking")
-    st.info("Search for products by code, add quantities, and generate an order file.")
+    st.info("� Gestión de pedidos de reposición. Agrega productos desde Stock & Pricing o importa un archivo de orden.")
     
-    all_products_restock = db.get_all_products()
-    
-    if all_products_restock:
-        # Create product code list for search
-        product_codes = [p['code'] for p in all_products_restock]
-        
-        # Search and Add Product to Order
-        so_col1, so_col2 = st.columns([2, 1])
-        
-        with so_col1:
-            selected_order_code = st.selectbox(
-                "🔍 Search Product by Code", 
-                options=product_codes,
-                format_func=lambda x: f"{x} - {next((p['name'] for p in all_products_restock if p['code'] == x), 'Unknown')}",
-                key="supply_order_search"
-            )
-        
-        # Show selected product details
-        if selected_order_code:
-            order_product = db.get_product(selected_order_code)
-            
-            if order_product:
-                st.markdown("---")
-                prod_col1, prod_col2, prod_col3 = st.columns([1, 2, 1])
-                
-                with prod_col1:
-                    # Product Image
-                    image_shown = False
-                    db_rel_path = order_product.get('image_path')
-                    
-                    if db_rel_path:
-                        db_rel_path = db_rel_path.replace('\\', '/')
-                        abs_path = os.path.join(config.BASE_DIR, db_rel_path)
-                        if os.path.exists(abs_path):
-                            st.image(abs_path, width=150)
-                            image_shown = True
-                    
-                    if not image_shown:
-                        safe_code = order_product['code'].replace('/', '-')
-                        fallback_abs_path = os.path.join(config.STATIC_DIR, f"{safe_code}.jpg")
-                        if os.path.exists(fallback_abs_path):
-                            st.image(fallback_abs_path, width=150)
-                            image_shown = True
-                    
-                    if not image_shown:
-                        st.image("https://placehold.co/150x150?text=No+Image", width=150)
-                
-                with prod_col2:
-                    st.markdown(f"**{order_product['name']}**")
-                    st.markdown(f"**Code:** `{order_product['code']}`")
-                    st.markdown(f"**Brand:** {order_product.get('brand', 'N/A')}")
-                    st.metric("Cost Price", f"${order_product['cost_price']:.2f}")
-                    st.metric("Current Stock", order_product['stock_quantity'])
-                
-                with prod_col3:
-                    order_qty = st.number_input("Order Quantity", min_value=1, value=1, key="order_qty_input")
-                    
-                    if st.button("➕ Add to Order", type="primary"):
-                        # Check if already in order
-                        existing = next((item for item in st.session_state.supply_order if item['code'] == order_product['code']), None)
-                        if existing:
-                            existing['quantity'] += order_qty
-                            st.toast(f"Updated quantity for {order_product['name']}")
-                        else:
-                            st.session_state.supply_order.append({
-                                'code': order_product['code'],
-                                'name': order_product['name'],
-                                'quantity': order_qty,
-                                'cost_price': order_product['cost_price']
-                            })
-                            st.toast(f"Added {order_product['name']} to order")
-                        st.rerun()
-        
-        # Show Current Order
-        if st.session_state.supply_order:
-            st.markdown("---")
-            st.subheader("📋 Current Order")
-            
-            # Display order as dataframe
-            order_df = pd.DataFrame(st.session_state.supply_order)
-            order_df['total'] = order_df['quantity'] * order_df['cost_price']
-            
-            st.dataframe(
-                order_df[['code', 'name', 'quantity', 'cost_price', 'total']],
-                column_config={
-                    "code": "Code",
-                    "name": "Product Name",
-                    "quantity": "Qty",
-                    "cost_price": st.column_config.NumberColumn("Cost Price", format="$%.2f"),
-                    "total": st.column_config.NumberColumn("Total", format="$%.2f")
-                },
-                hide_index=True,
-                width="stretch"
-            )
-            
-            total_order_cost = order_df['total'].sum()
-            st.metric("💰 Total Order Cost", f"${total_order_cost:,.2f}")
-            
-            # Action buttons
-            btn_col1, btn_col2, btn_col3 = st.columns(3)
-            
-            with btn_col1:
-                if st.button("📄 Generate Order File", type="primary"):
-                    import datetime
-                    import uuid
-                    
-                    # Generate unique order ID
-                    order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                    order_filename = f"order_{timestamp}.csv"
-                    order_filepath = os.path.join(config.LOG_DIR, order_filename)
-                    
-                    # Add order_id column to dataframe
-                    order_df['order_id'] = order_id
-                    
-                    # Save to CSV
-                    order_df.to_csv(order_filepath, index=False)
-                    st.success(f"Order saved: {order_filename}")
-                    st.info(f"📋 Order ID: **{order_id}**")
-                    st.session_state.last_order_file = order_filepath
-            
-            
-            with btn_col2:
-                if st.button("🗑️ Clear Order"):
-                    st.session_state.supply_order = []
-                    st.rerun()
-        
-        # Upload Order File Section
+    # Show Current Order
+    if st.session_state.supply_order:
         st.markdown("---")
-        st.subheader("📤 Import Order File")
-        st.info("Upload a previously generated order CSV to add stock when products arrive.")
+        st.subheader("📋 Current Order")
         
-        uploaded_order = st.file_uploader("Upload Order CSV", type=["csv"], key="order_csv_upload")
+        # Display order as dataframe
+        order_df = pd.DataFrame(st.session_state.supply_order)
+        order_df['total'] = order_df['quantity'] * order_df['cost_price']
         
-        if uploaded_order:
-            try:
-                import_df = pd.read_csv(uploaded_order)
+        st.dataframe(
+            order_df[['code', 'name', 'quantity', 'cost_price', 'total']],
+            column_config={
+                "code": "Code",
+                "name": "Product Name",
+                "quantity": "Qty",
+                "cost_price": st.column_config.NumberColumn("Cost Price", format="$%.2f"),
+                "total": st.column_config.NumberColumn("Total", format="$%.2f")
+            },
+            hide_index=True,
+            width="stretch"
+        )
+        
+        total_order_cost = order_df['total'].sum()
+        st.metric("💰 Total Order Cost", f"${total_order_cost:,.2f}")
+        
+        # Action buttons
+        btn_col1, btn_col2 = st.columns(2)
+        
+        with btn_col1:
+            if st.button("📄 Generate Order File", type="primary"):
+                import datetime
+                import uuid
                 
-                # Validate required columns
-                required_cols = ['code', 'quantity']
-                if not all(col in import_df.columns for col in required_cols):
-                    st.error(f"CSV must contain columns: {required_cols}")
-                elif 'order_id' not in import_df.columns:
-                    st.error("⚠️ This CSV doesn't have an Order ID. Only use order files generated by this system.")
-                else:
-                    # Get the order_id (same for all rows)
-                    order_id = import_df['order_id'].iloc[0]
-                    
-                    # Check if order was already used
-                    if db.is_order_used(order_id):
-                        st.error(f"❌ Order **{order_id}** was already redeemed. Cannot use the same order twice.")
-                    else:
-                        st.success(f"Order file loaded: {len(import_df)} products")
-                        st.info(f"📋 Order ID: **{order_id}**")
-                        
-                        # Preview
-                        preview_cols = ['code', 'name', 'quantity'] if 'name' in import_df.columns else ['code', 'quantity']
-                        st.dataframe(import_df[preview_cols], hide_index=True)
-                        
-                        total_items = int(import_df['quantity'].sum())
-                        st.metric("Total Items to Add", total_items)
-                        
-                        if st.button("✅ Confirm & Add Stock", type="primary", key="confirm_import_order"):
-                            # Mark order as used FIRST to prevent race conditions
-                            if db.mark_order_used(order_id, total_items):
-                                added_count = 0
-                                for _, row in import_df.iterrows():
-                                    code = row['code']
-                                    qty = int(row['quantity'])
-                                    if db.update_product(code, stock_delta=qty):
-                                        added_count += 1
-                                st.success(f"✅ Stock updated! Order **{order_id}** processed ({added_count} products).")
-                                st.balloons()
-                                st.rerun()
-                            else:
-                                st.error(f"❌ Order **{order_id}** was already redeemed (concurrent access prevented).")
-            except Exception as e:
-                st.error(f"Error reading CSV: {e}")
+                # Generate unique order ID
+                order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                order_filename = f"order_{timestamp}.csv"
+                order_filepath = os.path.join(config.LOG_DIR, order_filename)
+                
+                # Add order_id column to dataframe
+                order_df['order_id'] = order_id
+                
+                # Save to CSV
+                order_df.to_csv(order_filepath, index=False)
+                st.success(f"Order saved: {order_filename}")
+                st.info(f"📋 Order ID: **{order_id}**")
+                st.session_state.last_order_file = order_filepath
+        
+        with btn_col2:
+            if st.button("🗑️ Clear Order"):
+                st.session_state.supply_order = []
+                st.rerun()
     else:
-        st.warning("No products in database. Please upload a PDF in Stock & Pricing tab first.")
+        st.caption("No hay productos en el pedido actual. Agrega productos desde 📊 Stock & Pricing.")
+    
+    # Upload Order File Section
+    st.markdown("---")
+    st.subheader("📤 Import Order File")
+    st.info("Upload a previously generated order CSV to add stock when products arrive.")
+    
+    uploaded_order = st.file_uploader("Upload Order CSV", type=["csv"], key="order_csv_upload")
+    
+    if uploaded_order:
+        try:
+            import_df = pd.read_csv(uploaded_order)
+            
+            # Validate required columns
+            required_cols = ['code', 'quantity']
+            if not all(col in import_df.columns for col in required_cols):
+                st.error(f"CSV must contain columns: {required_cols}")
+            elif 'order_id' not in import_df.columns:
+                st.error("⚠️ This CSV doesn't have an Order ID. Only use order files generated by this system.")
+            else:
+                # Get the order_id (same for all rows)
+                order_id = import_df['order_id'].iloc[0]
+                
+                # Check if order was already used
+                if db.is_order_used(order_id):
+                    st.error(f"❌ Order **{order_id}** was already redeemed. Cannot use the same order twice.")
+                else:
+                    st.success(f"Order file loaded: {len(import_df)} products")
+                    st.info(f"📋 Order ID: **{order_id}**")
+                    
+                    # Preview
+                    preview_cols = ['code', 'name', 'quantity'] if 'name' in import_df.columns else ['code', 'quantity']
+                    st.dataframe(import_df[preview_cols], hide_index=True)
+                    
+                    total_items = int(import_df['quantity'].sum())
+                    st.metric("Total Items to Add", total_items)
+                    
+                    if st.button("✅ Confirm & Add Stock", type="primary", key="confirm_import_order"):
+                        # Mark order as used FIRST to prevent race conditions
+                        if db.mark_order_used(order_id, total_items):
+                            added_count = 0
+                            for _, row in import_df.iterrows():
+                                code = row['code']
+                                qty = int(row['quantity'])
+                                if db.update_product(code, stock_delta=qty):
+                                    added_count += 1
+                            st.success(f"✅ Stock updated! Order **{order_id}** processed ({added_count} products).")
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Order **{order_id}** was already redeemed (concurrent access prevented).")
+        except Exception as e:
+            st.error(f"Error reading CSV: {e}")
 
 # ==========================================
 # INTERFACE C: Point of Sale (POS)
