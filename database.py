@@ -36,6 +36,16 @@ def init_db():
         )
     ''')
     
+    # Used orders table - tracks redeemed order files to prevent duplicates
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS used_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT UNIQUE NOT NULL,
+            redeemed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            total_items INTEGER
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -152,6 +162,32 @@ def log_sale_db(total_amount, items_json):
     conn.close()
     return sale_id
 
+def is_order_used(order_id):
+    """Check if an order ID has already been redeemed."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM used_orders WHERE order_id = ?', (order_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def mark_order_used(order_id, total_items):
+    """Mark an order ID as redeemed to prevent duplicate use."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('INSERT INTO used_orders (order_id, total_items) VALUES (?, ?)', (order_id, total_items))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # Already exists
+        return False
+    finally:
+        conn.close()
+
 # Initialize DB on import if not exists
 if not os.path.exists(DB_NAME):
+    init_db()
+else:
+    # Ensure new tables exist in existing DB
     init_db()

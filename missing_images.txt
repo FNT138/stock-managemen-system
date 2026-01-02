@@ -1,3 +1,4 @@
+W 55006: Exception [Errno 2] No such file or directory: 'C:\\Users\\truji\\bicicleteria\\stock-managemen-system\\static\\W 55006.jpg'
 W200713: Img tag found but no src
 W200711: Img tag found but no src
 W200715: Img tag found but no src
@@ -21,8 +22,6 @@ W200720: Img tag found but no src
 5 450: Img tag found but no src
 H 4053: No image selector matched
 H 4050: No image selector matched
-H 5004: Img tag found but no src
-Z 4700: Img tag found but no src
 M 1548: Img tag found but no src
 J 1023: Img tag found but no src
 P 1263: No image selector matched

@@ -11,7 +11,7 @@ from database import update_product, log_sale_db, get_next_sale_number, add_prod
 import config
 
 # --- CONFIGURATION ---
-LOG_DIR = "logs"
+LOG_DIR = config.LOG_DIR
 DOWNLOADS_DIR = config.STATIC_DIR
 MISSING_IMAGES_LOG = "missing_images.txt"
 
@@ -23,11 +23,6 @@ SEARCH_TEMPLATE = "https://norbertominero.com.ar/buscar?controller=search&s={COD
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
-
-# Ensure directories exist
-for d in [LOG_DIR, DOWNLOADS_DIR]:
-    if not os.path.exists(d):
-        os.makedirs(d)
 
 def calculate_sale_price(cost_price):
     if cost_price is None: return 0.0

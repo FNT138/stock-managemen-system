@@ -12,6 +12,10 @@ DB_PATH = os.path.join(BASE_DIR, "products.db")
 STATIC_DIR_NAME = "static"
 STATIC_DIR = os.path.join(BASE_DIR, STATIC_DIR_NAME)
 
-# Ensure static directory exists
-if not os.path.exists(STATIC_DIR):
-    os.makedirs(STATIC_DIR)
+# Logs Directory
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+# Ensure directories exist
+for d in [STATIC_DIR, LOG_DIR]:
+    if not os.path.exists(d):
+        os.makedirs(d)
